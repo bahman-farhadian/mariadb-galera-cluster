@@ -1,4 +1,12 @@
 ---
+# =============================================================================
+# MariaDB Galera Cluster - Status Check Playbook
+# =============================================================================
+# Usage:
+#   ansible-playbook -i inventory/hosts.yml status.yml
+#   ansible-playbook -i inventory/hosts.yml status.yml --tags detailed
+# =============================================================================
+
 - name: Build Dynamic Inventory
   hosts: localhost
   gather_facts: false
@@ -35,6 +43,16 @@
         node_name: "{{ item.name }}"
       loop: "{{ garbd_nodes }}"
       when: garbd_enabled and garbd_nodes | length > 0
+
+- name: Prepare Remote Hosts
+  hosts: mariadb:loadbalancers:garbd
+  become: true
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Ensure Ansible temp directory exists
+      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+      changed_when: false
 
 - name: Check MariaDB Status
   hosts: mariadb
@@ -90,7 +108,7 @@
         node_status:
           name: "{{ node_name }}"
           ip: "{{ node_ip }}"
-          service: "{{ 'running' if mariadb_service.status.ActiveState == 'active' else 'stopped' }}"
+          service: "{{ 'running' if mariadb_service.status.ActiveState | default('unknown') == 'active' else 'stopped' }}"
           port: "{{ 'open' if port_check is succeeded else 'closed' }}"
           cluster_size: "N/A"
           cluster_status: "N/A"
@@ -104,7 +122,6 @@
   become: true
   gather_facts: false
   tags: [summary, detailed]
-  when: garbd_enabled
   tasks:
     - name: Check garbd service
       ansible.builtin.systemd:
@@ -117,14 +134,13 @@
         garbd_status:
           name: "{{ node_name }}"
           ip: "{{ node_ip }}"
-          service: "{{ 'running' if garbd_service.status.ActiveState == 'active' else 'stopped' }}"
+          service: "{{ 'running' if garbd_service.status.ActiveState | default('unknown') == 'active' else 'stopped' }}"
 
 - name: Check HAProxy Status
   hosts: loadbalancers
   become: true
   gather_facts: false
   tags: [summary, detailed, haproxy]
-  when: haproxy_nodes | length > 0
   tasks:
     - name: Check HAProxy service
       ansible.builtin.systemd:
@@ -145,7 +161,7 @@
         haproxy_status:
           name: "{{ node_name }}"
           ip: "{{ node_ip }}"
-          service: "{{ 'running' if haproxy_service.status.ActiveState == 'active' else 'stopped' }}"
+          service: "{{ 'running' if haproxy_service.status.ActiveState | default('unknown') == 'active' else 'stopped' }}"
           port: "{{ 'open' if haproxy_port_check is succeeded else 'closed' }}"
 
 - name: Display Status Summary
@@ -175,7 +191,7 @@
           {{ hostvars[host]['garbd_status']['name'] }} ({{ hostvars[host]['garbd_status']['ip'] }})
             Service: {{ hostvars[host]['garbd_status']['service'] }}
           {% endfor %}
-      when: garbd_enabled and groups['garbd'] | default([]) | length > 0
+      when: groups['garbd'] | default([]) | length > 0
 
     - name: Display HAProxy nodes
       ansible.builtin.debug:
@@ -186,7 +202,7 @@
             Service: {{ hostvars[host]['haproxy_status']['service'] }} | Port: {{ hostvars[host]['haproxy_status']['port'] }}
           {% if haproxy_stats_enabled %}  Stats: http://{{ hostvars[host]['haproxy_status']['ip'] }}:{{ haproxy_stats_port }}/stats{% endif %}
           {% endfor %}
-      when: haproxy_nodes | length > 0
+      when: groups['loadbalancers'] | default([]) | length > 0
 
     - name: Display connection info
       ansible.builtin.debug:

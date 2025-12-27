@@ -1,16 +1,16 @@
 ---
+- name: Stop MariaDB before configuration
+  ansible.builtin.systemd:
+    name: mariadb
+    state: stopped
+  ignore_errors: true
+
 - name: Configure MariaDB to listen on all interfaces
   ansible.builtin.lineinfile:
     path: "{{ mysql_conf_dir }}/50-server.cnf"
     regexp: "^bind-address"
     line: "bind-address = 0.0.0.0"
     backup: true
-  notify: Restart mariadb rolling
-
-- name: Check if Galera configuration exists
-  ansible.builtin.stat:
-    path: "{{ mysql_conf_dir }}/60-galera.cnf"
-  register: galera_conf_stat
 
 - name: Deploy Galera configuration
   ansible.builtin.template:
@@ -20,13 +20,6 @@
     group: root
     mode: "0644"
     backup: true
-  notify: Restart mariadb rolling
-
-- name: Ensure MariaDB is stopped before initial configuration
-  ansible.builtin.systemd:
-    name: mariadb
-    state: stopped
-  when: not galera_conf_stat.stat.exists
 
 - name: Create grastate.dat marker to prevent unsafe bootstrap
   ansible.builtin.copy:

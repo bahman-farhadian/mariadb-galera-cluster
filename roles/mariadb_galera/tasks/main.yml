@@ -1,4 +1,8 @@
 ---
+- name: Ensure Ansible temp directory exists
+  ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+  changed_when: false
+
 - name: Include installation tasks
   ansible.builtin.include_tasks: install.yml
   tags: [install]

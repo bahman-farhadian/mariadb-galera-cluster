@@ -1,4 +1,8 @@
 ---
+- name: Ensure Ansible temp directory exists
+  ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+  changed_when: false
+
 - name: Update apt cache
   ansible.builtin.apt:
     update_cache: true
@@ -18,17 +22,20 @@
     mode: "0644"
     backup: true
     validate: "haproxy -c -f %s"
-  notify: Reload haproxy
 
-- name: Start and enable HAProxy
+- name: Restart and enable HAProxy
   ansible.builtin.systemd:
     name: haproxy
-    state: started
+    state: restarted
     enabled: true
+    daemon_reload: true
 
-- name: Wait for HAProxy
-  ansible.builtin.wait_for:
-    port: "{{ mysql_port }}"
-    host: "{{ node_ip }}"
-    delay: 2
-    timeout: 30
+- name: Wait for HAProxy to start
+  ansible.builtin.pause:
+    seconds: 3
+
+- name: Verify HAProxy is listening on MySQL port
+  ansible.builtin.shell: ss -tlnp | grep ":{{ mysql_port }}"
+  register: haproxy_mysql_check
+  changed_when: false
+  failed_when: haproxy_mysql_check.rc != 0

@@ -96,6 +96,16 @@
       loop: "{{ garbd_nodes }}"
       when: garbd_enabled and garbd_nodes | length > 0
 
+- name: Prepare Remote Hosts
+  hosts: mariadb:loadbalancers:garbd
+  become: true
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Ensure Ansible temp directory exists
+      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+      changed_when: false
+
 - name: Deploy MariaDB Galera Cluster
   hosts: mariadb
   become: true
@@ -111,13 +121,12 @@
   gather_facts: false
   tags: [mariadb, bootstrap]
   tasks:
-    - name: Check if cluster is running
+    - name: Check if cluster is already running
       ansible.builtin.shell: |
-        mariadb -u root -p'{{ mariadb_root_password }}' -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | grep -oP '\d+' || echo "0"
+        systemctl is-active mariadb && mariadb -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | grep -oP '\d+' || echo "0"
       register: cluster_size_check
       changed_when: false
       failed_when: false
-      no_log: true
 
     - name: Bootstrap cluster if not running
       when: cluster_size_check.stdout | int < 1
@@ -126,6 +135,13 @@
           ansible.builtin.systemd:
             name: mariadb
             state: stopped
+          ignore_errors: true
+
+        - name: Set safe_to_bootstrap flag
+          ansible.builtin.lineinfile:
+            path: "{{ mysql_data_dir }}/grastate.dat"
+            regexp: "^safe_to_bootstrap:"
+            line: "safe_to_bootstrap: 1"
 
         - name: Bootstrap new cluster
           ansible.builtin.command: galera_new_cluster
@@ -225,7 +241,6 @@
   become: true
   gather_facts: true
   tags: [garbd]
-  when: garbd_enabled
   tasks:
     - name: Update apt cache
       ansible.builtin.apt:
@@ -262,7 +277,6 @@
   gather_facts: true
   serial: 1
   tags: [haproxy]
-  when: haproxy_nodes | length > 0
   roles:
     - haproxy
 

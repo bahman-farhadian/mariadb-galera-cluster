@@ -1,4 +1,13 @@
 ---
+# =============================================================================
+# MariaDB Galera Cluster - Recovery Playbook
+# =============================================================================
+# Use this playbook to recover a cluster after complete failure.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.yml recover.yml
+# =============================================================================
+
 - name: Build Dynamic Inventory
   hosts: localhost
   gather_facts: false
@@ -32,14 +41,29 @@
     - name: Display warning
       ansible.builtin.debug:
         msg: |
+          ============================================
           WARNING: CLUSTER RECOVERY
-          This will stop all services and bootstrap from most up-to-date node.
+          ============================================
+          This will:
+          1. Stop all MariaDB and garbd services
+          2. Find the most up-to-date node
+          3. Bootstrap from that node
+          ============================================
 
     - name: Confirm
       ansible.builtin.pause:
         prompt: "Press ENTER to continue or Ctrl+C to abort"
 
-- name: Stop All Services
+- name: Prepare Remote Hosts
+  hosts: mariadb:garbd
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Ensure Ansible temp directory exists
+      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+      changed_when: false
+
+- name: Stop All MariaDB Services
   hosts: mariadb
   become: true
   gather_facts: false
@@ -50,11 +74,10 @@
         state: stopped
       ignore_errors: true
 
-- name: Stop Garbd Services
+- name: Stop All Garbd Services
   hosts: garbd
   become: true
   gather_facts: false
-  when: garbd_enabled
   tasks:
     - name: Stop garbd
       ansible.builtin.systemd:
@@ -159,11 +182,10 @@
       changed_when: false
       no_log: true
 
-- name: Restart Garbd
+- name: Restart Garbd Services
   hosts: garbd
   become: true
   gather_facts: false
-  when: garbd_enabled
   tasks:
     - name: Start garbd
       ansible.builtin.systemd:
@@ -179,11 +201,15 @@
       ansible.builtin.shell: |
         mariadb -u root -p'{{ mariadb_root_password }}' -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | tail -1 | awk '{print $2}'
       register: final_cluster_size
+      changed_when: false
       no_log: true
 
     - name: Display summary
       ansible.builtin.debug:
         msg: |
+          ============================================
           Recovery Complete!
+          ============================================
           Cluster Size: {{ final_cluster_size.stdout }}
           Expected: {{ mariadb_nodes | length }}
+          ============================================

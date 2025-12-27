@@ -3,11 +3,11 @@
 
 [mariadb]
 server_id               = {{ server_id }}
-log_bin                 = {{ mysql_log_dir }}/mysql-bin.log
 binlog_format           = ROW
 default_storage_engine  = InnoDB
 innodb_autoinc_lock_mode = 2
 
+# Galera Provider Configuration
 wsrep_on                = ON
 wsrep_provider          = /usr/lib/galera/libgalera_smm.so
 wsrep_cluster_name      = "{{ cluster_name }}"

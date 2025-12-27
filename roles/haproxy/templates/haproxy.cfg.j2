@@ -21,7 +21,7 @@ defaults
     timeout server  30m
 
 listen mariadb_cluster
-    bind {{ node_ip }}:{{ mysql_port }}
+    bind 0.0.0.0:{{ mysql_port }}
     mode tcp
     option tcplog
     option tcpka
@@ -34,11 +34,11 @@ listen mariadb_cluster
 
 {% if haproxy_stats_enabled %}
 listen stats
-    bind {{ node_ip }}:{{ haproxy_stats_port }}
+    bind 0.0.0.0:{{ haproxy_stats_port }}
     mode http
     stats enable
     stats uri /stats
     stats refresh 10s
-    stats admin if LOCALHOST
+    stats admin if TRUE
     stats auth {{ haproxy_stats_user }}:{{ haproxy_stats_password }}
 {% endif %}
