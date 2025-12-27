@@ -1,0 +1,656 @@
+---
+# =============================================================================
+# MariaDB Galera Cluster - Unified Playbook
+# =============================================================================
+#
+# USAGE:
+#   Deploy full cluster:     ansible-playbook mariadb.yml --tags deploy
+#   Deploy MariaDB only:     ansible-playbook mariadb.yml --tags deploy-mariadb
+#   Deploy HAProxy only:     ansible-playbook mariadb.yml --tags deploy-haproxy
+#   Deploy Garbd only:       ansible-playbook mariadb.yml --tags deploy-garbd
+#   Check cluster status:    ansible-playbook mariadb.yml --tags status
+#   Detailed status:         ansible-playbook mariadb.yml --tags status-detailed
+#   Recover cluster:         ansible-playbook mariadb.yml --tags recover
+#
+# =============================================================================
+
+# =============================================================================
+# COMMON: Build Dynamic Inventory (runs for all operations)
+# =============================================================================
+- name: Build Dynamic Inventory
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Validate minimum node count
+      ansible.builtin.fail:
+        msg: "Minimum 2 MariaDB nodes required. You have {{ mariadb_nodes | length }}."
+      when: mariadb_nodes | length < 2
+
+    - name: Validate garbd configuration
+      ansible.builtin.fail:
+        msg: "garbd_enabled is true but garbd_nodes is empty."
+      when: garbd_enabled and (garbd_nodes | length == 0)
+
+    - name: Add MariaDB nodes to inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        groups: mariadb
+        server_id: "{{ idx + 1 }}"
+        node_ip: "{{ item.ip }}"
+        node_name: "{{ item.name }}"
+      loop: "{{ mariadb_nodes }}"
+      loop_control:
+        index_var: idx
+
+    - name: Add HAProxy nodes to inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        groups: loadbalancers
+        node_ip: "{{ item.ip }}"
+        node_name: "{{ item.name }}"
+      loop: "{{ haproxy_nodes }}"
+      when: haproxy_nodes | length > 0
+
+    - name: Add Garbd nodes to inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        groups: garbd
+        node_ip: "{{ item.ip }}"
+        node_name: "{{ item.name }}"
+      loop: "{{ garbd_nodes }}"
+      when: garbd_enabled and garbd_nodes | length > 0
+
+# =============================================================================
+# DEPLOY: Display Summary
+# =============================================================================
+- name: Deployment Summary
+  hosts: localhost
+  gather_facts: false
+  tags: [deploy, deploy-mariadb, deploy-haproxy, deploy-garbd]
+  tasks:
+    - name: Display deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          MariaDB Galera Cluster Deployment
+          ============================================
+          Cluster: {{ cluster_name }}
+          MariaDB: {{ mariadb_nodes | length }} nodes
+          HAProxy: {{ haproxy_nodes | length }} nodes
+          Garbd: {{ 'enabled' if garbd_enabled else 'disabled' }}
+          SST: {{ sst_method }}
+          ============================================
+
+# =============================================================================
+# DEPLOY: Prepare Remote Hosts
+# =============================================================================
+- name: Prepare Remote Hosts
+  hosts: mariadb:loadbalancers:garbd
+  become: true
+  gather_facts: false
+  tags: [deploy, deploy-mariadb, deploy-haproxy, deploy-garbd]
+  tasks:
+    - name: Ensure Ansible temp directory exists
+      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+      changed_when: false
+
+# =============================================================================
+# DEPLOY: MariaDB Galera Nodes
+# =============================================================================
+- name: Deploy MariaDB Galera Cluster
+  hosts: mariadb
+  become: true
+  gather_facts: true
+  serial: 1
+  tags: [deploy, deploy-mariadb]
+  roles:
+    - mariadb_galera
+
+- name: Bootstrap Galera Cluster
+  hosts: mariadb[0]
+  become: true
+  gather_facts: false
+  tags: [deploy, deploy-mariadb]
+  tasks:
+    - name: Check if cluster is already running
+      ansible.builtin.shell: |
+        systemctl is-active mariadb && mariadb -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | grep -oP '\d+' || echo "0"
+      register: cluster_size_check
+      changed_when: false
+      failed_when: false
+
+    - name: Bootstrap cluster if not running
+      when: cluster_size_check.stdout | int < 1
+      block:
+        - name: Stop MariaDB
+          ansible.builtin.systemd:
+            name: mariadb
+            state: stopped
+          ignore_errors: true
+
+        - name: Set safe_to_bootstrap flag
+          ansible.builtin.lineinfile:
+            path: "{{ mysql_data_dir }}/grastate.dat"
+            regexp: "^safe_to_bootstrap:"
+            line: "safe_to_bootstrap: 1"
+
+        - name: Bootstrap new cluster
+          ansible.builtin.command: galera_new_cluster
+
+        - name: Wait for bootstrap node
+          ansible.builtin.wait_for:
+            port: "{{ mysql_port }}"
+            host: "{{ node_ip }}"
+            delay: 5
+            timeout: 60
+
+- name: Start Remaining MariaDB Nodes
+  hosts: mariadb[1:]
+  become: true
+  gather_facts: false
+  serial: 1
+  tags: [deploy, deploy-mariadb]
+  tasks:
+    - name: Start MariaDB
+      ansible.builtin.systemd:
+        name: mariadb
+        state: started
+        enabled: true
+
+    - name: Wait for sync
+      ansible.builtin.shell: |
+        mariadb -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | grep -i synced
+      register: sync_status
+      until: sync_status.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+- name: Secure Cluster
+  hosts: mariadb[0]
+  become: true
+  gather_facts: false
+  tags: [deploy, deploy-mariadb]
+  tasks:
+    - name: Set root password
+      community.mysql.mysql_user:
+        name: root
+        password: "{{ mariadb_root_password }}"
+        host_all: true
+        login_unix_socket: /run/mysqld/mysqld.sock
+        state: present
+      no_log: true
+      ignore_errors: true
+
+    - name: Create admin user
+      community.mysql.mysql_user:
+        name: "{{ admin_user }}"
+        password: "{{ admin_password }}"
+        host: "%"
+        priv: "*.*:ALL,GRANT"
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /run/mysqld/mysqld.sock
+        state: present
+      no_log: true
+
+    - name: Create SST user (mariabackup only)
+      community.mysql.mysql_user:
+        name: "{{ sst_user }}"
+        password: "{{ sst_password }}"
+        host: "localhost"
+        priv: "*.*:RELOAD,PROCESS,LOCK TABLES,REPLICATION CLIENT"
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /run/mysqld/mysqld.sock
+        state: present
+      when: sst_method == "mariabackup"
+      no_log: true
+
+    - name: Remove anonymous users
+      community.mysql.mysql_user:
+        name: ""
+        host_all: true
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /run/mysqld/mysqld.sock
+        state: absent
+      no_log: true
+
+    - name: Remove test database
+      community.mysql.mysql_db:
+        name: test
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /run/mysqld/mysqld.sock
+        state: absent
+      no_log: true
+
+# =============================================================================
+# DEPLOY: Galera Arbitrator (optional)
+# =============================================================================
+- name: Deploy Galera Arbitrator
+  hosts: garbd
+  become: true
+  gather_facts: true
+  tags: [deploy, deploy-garbd]
+  tasks:
+    - name: Ensure Ansible temp directory exists
+      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+      changed_when: false
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install Galera Arbitrator
+      ansible.builtin.apt:
+        name: galera-arbitrator-4
+        state: present
+
+    - name: Configure Galera Arbitrator
+      ansible.builtin.template:
+        src: roles/mariadb_galera/templates/garb.j2
+        dest: /etc/default/garb
+        mode: "0644"
+
+    - name: Restart and enable garbd
+      ansible.builtin.systemd:
+        name: garb
+        state: restarted
+        enabled: true
+
+# =============================================================================
+# DEPLOY: HAProxy Load Balancers
+# =============================================================================
+- name: Deploy HAProxy Load Balancers
+  hosts: loadbalancers
+  become: true
+  gather_facts: true
+  serial: 1
+  tags: [deploy, deploy-haproxy]
+  roles:
+    - haproxy
+
+# =============================================================================
+# DEPLOY: Verification
+# =============================================================================
+- name: Verify Deployment
+  hosts: mariadb[0]
+  become: true
+  gather_facts: false
+  tags: [deploy, deploy-mariadb]
+  tasks:
+    - name: Get cluster size
+      ansible.builtin.shell: |
+        mariadb -u {{ admin_user }} -p'{{ admin_password }}' -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | tail -1 | awk '{print $2}'
+      register: final_cluster_size
+      changed_when: false
+      no_log: true
+
+    - name: Display deployment result
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Deployment Complete!
+          ============================================
+          Cluster Size: {{ final_cluster_size.stdout }}/{{ mariadb_nodes | length }}
+          {% if haproxy_nodes | length > 0 %}
+          Connect via LB: mysql -h {{ haproxy_nodes[0].ip }} -u {{ admin_user }} -p
+          Stats: http://{{ haproxy_nodes[0].ip }}:{{ haproxy_stats_port }}/stats
+          {% else %}
+          Connect: mysql -h {{ mariadb_nodes[0].ip }} -u {{ admin_user }} -p
+          {% endif %}
+          ============================================
+
+# =============================================================================
+# STATUS: Check Cluster Status
+# =============================================================================
+- name: Prepare for Status Check
+  hosts: mariadb:loadbalancers:garbd
+  become: true
+  gather_facts: false
+  tags: [status, status-detailed]
+  tasks:
+    - name: Ensure Ansible temp directory exists
+      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+      changed_when: false
+
+- name: Check MariaDB Status
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [status, status-detailed]
+  tasks:
+    - name: Check MariaDB service
+      ansible.builtin.systemd:
+        name: mariadb
+      register: mariadb_service
+      ignore_errors: true
+
+    - name: Get wsrep status
+      ansible.builtin.shell: |
+        mariadb -u {{ admin_user }} -p'{{ admin_password }}' -N -e "
+        SELECT 
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size'),
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_status'),
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment'),
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_ready'),
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_connected');
+        " 2>/dev/null
+      register: wsrep_status
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Set node status
+      ansible.builtin.set_fact:
+        node_status:
+          name: "{{ node_name }}"
+          ip: "{{ node_ip }}"
+          service: "{{ 'running' if mariadb_service.status.ActiveState | default('unknown') == 'active' else 'stopped' }}"
+          cluster_size: "{{ wsrep_status.stdout.split('\t')[0] | default('N/A') }}"
+          cluster_status: "{{ wsrep_status.stdout.split('\t')[1] | default('N/A') }}"
+          node_state: "{{ wsrep_status.stdout.split('\t')[2] | default('N/A') }}"
+          ready: "{{ wsrep_status.stdout.split('\t')[3] | default('N/A') }}"
+          connected: "{{ wsrep_status.stdout.split('\t')[4] | default('N/A') }}"
+
+- name: Check HAProxy Status
+  hosts: loadbalancers
+  become: true
+  gather_facts: false
+  tags: [status, status-detailed]
+  tasks:
+    - name: Check HAProxy service
+      ansible.builtin.systemd:
+        name: haproxy
+      register: haproxy_service
+      ignore_errors: true
+
+    - name: Check HAProxy port
+      ansible.builtin.shell: ss -tlnp | grep ":{{ mysql_port }}"
+      register: haproxy_port
+      changed_when: false
+      failed_when: false
+
+    - name: Set HAProxy status
+      ansible.builtin.set_fact:
+        haproxy_status:
+          name: "{{ node_name }}"
+          ip: "{{ node_ip }}"
+          service: "{{ 'running' if haproxy_service.status.ActiveState | default('unknown') == 'active' else 'stopped' }}"
+          port: "{{ 'listening' if haproxy_port.rc == 0 else 'not listening' }}"
+
+- name: Check Garbd Status
+  hosts: garbd
+  become: true
+  gather_facts: false
+  tags: [status, status-detailed]
+  tasks:
+    - name: Check garbd service
+      ansible.builtin.systemd:
+        name: garb
+      register: garbd_service
+      ignore_errors: true
+
+    - name: Set garbd status
+      ansible.builtin.set_fact:
+        garbd_status:
+          name: "{{ node_name }}"
+          ip: "{{ node_ip }}"
+          service: "{{ 'running' if garbd_service.status.ActiveState | default('unknown') == 'active' else 'stopped' }}"
+
+- name: Display Status Summary
+  hosts: localhost
+  gather_facts: false
+  tags: [status, status-detailed]
+  tasks:
+    - name: Display cluster status
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          MariaDB Galera Cluster Status
+          ============================================
+          
+          MARIADB NODES:
+          {% for host in groups['mariadb'] %}
+          {{ hostvars[host]['node_status']['name'] }} ({{ hostvars[host]['node_status']['ip'] }})
+            Service: {{ hostvars[host]['node_status']['service'] }}
+            Cluster: {{ hostvars[host]['node_status']['cluster_size'] }} nodes | {{ hostvars[host]['node_status']['cluster_status'] }}
+            State: {{ hostvars[host]['node_status']['node_state'] }} | Ready: {{ hostvars[host]['node_status']['ready'] }}
+          {% endfor %}
+          {% if groups['loadbalancers'] | default([]) | length > 0 %}
+          
+          HAPROXY NODES:
+          {% for host in groups['loadbalancers'] %}
+          {{ hostvars[host]['haproxy_status']['name'] }} ({{ hostvars[host]['haproxy_status']['ip'] }})
+            Service: {{ hostvars[host]['haproxy_status']['service'] }} | Port 3306: {{ hostvars[host]['haproxy_status']['port'] }}
+            Stats: http://{{ hostvars[host]['haproxy_status']['ip'] }}:{{ haproxy_stats_port }}/stats
+          {% endfor %}
+          {% endif %}
+          {% if groups['garbd'] | default([]) | length > 0 %}
+          
+          GARBD NODES:
+          {% for host in groups['garbd'] %}
+          {{ hostvars[host]['garbd_status']['name'] }} ({{ hostvars[host]['garbd_status']['ip'] }})
+            Service: {{ hostvars[host]['garbd_status']['service'] }}
+          {% endfor %}
+          {% endif %}
+          ============================================
+
+- name: Detailed Status (per node)
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [status-detailed]
+  tasks:
+    - name: Get full wsrep status
+      ansible.builtin.shell: |
+        mariadb -u {{ admin_user }} -p'{{ admin_password }}' -e "SHOW STATUS LIKE 'wsrep_%';" 2>/dev/null
+      register: full_wsrep
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Display detailed status
+      ansible.builtin.debug:
+        msg: |
+          === {{ node_name }} ({{ node_ip }}) ===
+          {{ full_wsrep.stdout }}
+      when: full_wsrep.rc == 0
+
+# =============================================================================
+# RECOVER: Cluster Recovery
+# =============================================================================
+- name: Confirm Recovery
+  hosts: localhost
+  gather_facts: false
+  tags: [recover]
+  tasks:
+    - name: Display recovery warning
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          WARNING: CLUSTER RECOVERY
+          ============================================
+          This will:
+          1. Stop all MariaDB and garbd services
+          2. Find the most up-to-date node
+          3. Bootstrap cluster from that node
+          4. Rejoin all other nodes
+          ============================================
+
+    - name: Confirm recovery
+      ansible.builtin.pause:
+        prompt: "Press ENTER to continue or Ctrl+C to abort"
+
+- name: Prepare for Recovery
+  hosts: mariadb:garbd
+  become: true
+  gather_facts: false
+  tags: [recover]
+  tasks:
+    - name: Ensure Ansible temp directory exists
+      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+      changed_when: false
+
+- name: Stop All Services
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [recover]
+  tasks:
+    - name: Stop MariaDB
+      ansible.builtin.systemd:
+        name: mariadb
+        state: stopped
+      ignore_errors: true
+
+- name: Stop Garbd Services
+  hosts: garbd
+  become: true
+  gather_facts: false
+  tags: [recover]
+  tasks:
+    - name: Stop garbd
+      ansible.builtin.systemd:
+        name: garb
+        state: stopped
+      ignore_errors: true
+
+- name: Find Most Recent Node
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [recover]
+  tasks:
+    - name: Read grastate.dat
+      ansible.builtin.slurp:
+        src: "{{ mysql_data_dir }}/grastate.dat"
+      register: grastate_content
+      ignore_errors: true
+
+    - name: Parse seqno
+      ansible.builtin.set_fact:
+        node_seqno: "{{ (grastate_content.content | b64decode | regex_search('seqno:\\s*(-?\\d+)', '\\1'))[0] | default('-1') }}"
+      when: grastate_content is succeeded
+
+    - name: Set default seqno if failed
+      ansible.builtin.set_fact:
+        node_seqno: "-1"
+      when: grastate_content is failed
+
+    - name: Display node seqno
+      ansible.builtin.debug:
+        msg: "{{ node_name }}: seqno={{ node_seqno }}"
+
+- name: Select Bootstrap Node
+  hosts: localhost
+  gather_facts: false
+  tags: [recover]
+  tasks:
+    - name: Collect seqno values
+      ansible.builtin.set_fact:
+        node_seqnos: "{{ node_seqnos | default({}) | combine({item: hostvars[item]['node_seqno'] | int}) }}"
+      loop: "{{ groups['mariadb'] }}"
+
+    - name: Find highest seqno
+      ansible.builtin.set_fact:
+        bootstrap_node: "{{ node_seqnos | dict2items | sort(attribute='value', reverse=true) | first }}"
+
+    - name: Set bootstrap node
+      ansible.builtin.set_fact:
+        selected_bootstrap_node: "{{ bootstrap_node.key }}"
+
+    - name: Display selected node
+      ansible.builtin.debug:
+        msg: "Selected bootstrap node: {{ bootstrap_node.key }} (seqno: {{ bootstrap_node.value }})"
+
+- name: Prepare Bootstrap Node
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [recover]
+  tasks:
+    - name: Check if this is bootstrap node
+      ansible.builtin.set_fact:
+        is_bootstrap: "{{ inventory_hostname == hostvars['localhost']['selected_bootstrap_node'] }}"
+
+    - name: Set safe_to_bootstrap on selected node
+      ansible.builtin.lineinfile:
+        path: "{{ mysql_data_dir }}/grastate.dat"
+        regexp: "^safe_to_bootstrap:"
+        line: "safe_to_bootstrap: 1"
+      when: is_bootstrap
+
+- name: Bootstrap and Rejoin Cluster
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  serial: 1
+  tags: [recover]
+  tasks:
+    - name: Bootstrap cluster (selected node only)
+      ansible.builtin.command: galera_new_cluster
+      when: hostvars[inventory_hostname]['is_bootstrap'] | default(false)
+
+    - name: Wait for bootstrap
+      ansible.builtin.wait_for:
+        port: "{{ mysql_port }}"
+        host: "{{ node_ip }}"
+        delay: 5
+        timeout: 120
+      when: hostvars[inventory_hostname]['is_bootstrap'] | default(false)
+
+    - name: Start MariaDB (other nodes)
+      ansible.builtin.systemd:
+        name: mariadb
+        state: started
+      when: not (hostvars[inventory_hostname]['is_bootstrap'] | default(false))
+
+    - name: Wait for sync (other nodes)
+      ansible.builtin.shell: |
+        mariadb -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | grep -i synced
+      register: sync_status
+      until: sync_status.rc == 0
+      retries: 60
+      delay: 10
+      changed_when: false
+      when: not (hostvars[inventory_hostname]['is_bootstrap'] | default(false))
+
+- name: Restart Garbd
+  hosts: garbd
+  become: true
+  gather_facts: false
+  tags: [recover]
+  tasks:
+    - name: Start garbd
+      ansible.builtin.systemd:
+        name: garb
+        state: started
+
+- name: Verify Recovery
+  hosts: mariadb[0]
+  become: true
+  gather_facts: false
+  tags: [recover]
+  tasks:
+    - name: Get final cluster size
+      ansible.builtin.shell: |
+        mariadb -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | tail -1 | awk '{print $2}'
+      register: recovered_size
+      changed_when: false
+
+    - name: Display recovery result
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Recovery Complete!
+          ============================================
+          Cluster Size: {{ recovered_size.stdout }}/{{ mariadb_nodes | length }}
+          ============================================
