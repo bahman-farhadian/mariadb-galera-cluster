@@ -1,0 +1,34 @@
+---
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install HAProxy
+  ansible.builtin.apt:
+    name: haproxy
+    state: present
+
+- name: Deploy HAProxy configuration
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+    validate: "haproxy -c -f %s"
+  notify: Reload haproxy
+
+- name: Start and enable HAProxy
+  ansible.builtin.systemd:
+    name: haproxy
+    state: started
+    enabled: true
+
+- name: Wait for HAProxy
+  ansible.builtin.wait_for:
+    port: "{{ mysql_port }}"
+    host: "{{ node_ip }}"
+    delay: 2
+    timeout: 30

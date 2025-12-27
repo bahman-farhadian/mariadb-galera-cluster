@@ -1,0 +1,8 @@
+---
+- name: Include installation tasks
+  ansible.builtin.include_tasks: install.yml
+  tags: [install]
+
+- name: Include configuration tasks
+  ansible.builtin.include_tasks: configure.yml
+  tags: [configure]

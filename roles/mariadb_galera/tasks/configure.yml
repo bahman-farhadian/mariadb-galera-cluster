@@ -1,0 +1,43 @@
+---
+- name: Configure MariaDB to listen on all interfaces
+  ansible.builtin.lineinfile:
+    path: "{{ mysql_conf_dir }}/50-server.cnf"
+    regexp: "^bind-address"
+    line: "bind-address = 0.0.0.0"
+    backup: true
+  notify: Restart mariadb rolling
+
+- name: Check if Galera configuration exists
+  ansible.builtin.stat:
+    path: "{{ mysql_conf_dir }}/60-galera.cnf"
+  register: galera_conf_stat
+
+- name: Deploy Galera configuration
+  ansible.builtin.template:
+    src: 60-galera.cnf.j2
+    dest: "{{ mysql_conf_dir }}/60-galera.cnf"
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  notify: Restart mariadb rolling
+
+- name: Ensure MariaDB is stopped before initial configuration
+  ansible.builtin.systemd:
+    name: mariadb
+    state: stopped
+  when: not galera_conf_stat.stat.exists
+
+- name: Create grastate.dat marker to prevent unsafe bootstrap
+  ansible.builtin.copy:
+    content: |
+      # GALERA saved state
+      version: 2.1
+      uuid: 00000000-0000-0000-0000-000000000000
+      seqno: -1
+      safe_to_bootstrap: 0
+    dest: "{{ mysql_data_dir }}/grastate.dat"
+    owner: mysql
+    group: mysql
+    mode: "0644"
+    force: false

@@ -1,0 +1,224 @@
+---
+- name: Build Dynamic Inventory
+  hosts: localhost
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Add MariaDB nodes
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        groups: mariadb
+        server_id: "{{ idx + 1 }}"
+        node_ip: "{{ item.ip }}"
+        node_name: "{{ item.name }}"
+      loop: "{{ mariadb_nodes }}"
+      loop_control:
+        index_var: idx
+
+    - name: Add HAProxy nodes
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        groups: loadbalancers
+        node_ip: "{{ item.ip }}"
+        node_name: "{{ item.name }}"
+      loop: "{{ haproxy_nodes }}"
+      when: haproxy_nodes | length > 0
+
+    - name: Add Garbd nodes
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        groups: garbd
+        node_ip: "{{ item.ip }}"
+        node_name: "{{ item.name }}"
+      loop: "{{ garbd_nodes }}"
+      when: garbd_enabled and garbd_nodes | length > 0
+
+- name: Check MariaDB Status
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [summary, detailed]
+  tasks:
+    - name: Check MariaDB service
+      ansible.builtin.systemd:
+        name: mariadb
+      register: mariadb_service
+      ignore_errors: true
+
+    - name: Check port connectivity
+      ansible.builtin.wait_for:
+        port: "{{ mysql_port }}"
+        host: "{{ node_ip }}"
+        timeout: 5
+      register: port_check
+      ignore_errors: true
+
+    - name: Get wsrep status
+      ansible.builtin.shell: |
+        mariadb -u {{ admin_user }} -p'{{ admin_password }}' -N -e "
+        SELECT 
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size'),
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_status'),
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment'),
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_ready'),
+          (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_connected');
+        " 2>/dev/null
+      register: wsrep_status
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Parse wsrep status
+      ansible.builtin.set_fact:
+        node_status:
+          name: "{{ node_name }}"
+          ip: "{{ node_ip }}"
+          service: "{{ 'running' if mariadb_service.status.ActiveState == 'active' else 'stopped' }}"
+          port: "{{ 'open' if port_check is succeeded else 'closed' }}"
+          cluster_size: "{{ wsrep_status.stdout.split('\t')[0] | default('N/A') }}"
+          cluster_status: "{{ wsrep_status.stdout.split('\t')[1] | default('N/A') }}"
+          node_state: "{{ wsrep_status.stdout.split('\t')[2] | default('N/A') }}"
+          ready: "{{ wsrep_status.stdout.split('\t')[3] | default('N/A') }}"
+          connected: "{{ wsrep_status.stdout.split('\t')[4] | default('N/A') }}"
+      when: wsrep_status.rc == 0
+
+    - name: Set failed status
+      ansible.builtin.set_fact:
+        node_status:
+          name: "{{ node_name }}"
+          ip: "{{ node_ip }}"
+          service: "{{ 'running' if mariadb_service.status.ActiveState == 'active' else 'stopped' }}"
+          port: "{{ 'open' if port_check is succeeded else 'closed' }}"
+          cluster_size: "N/A"
+          cluster_status: "N/A"
+          node_state: "UNREACHABLE"
+          ready: "N/A"
+          connected: "N/A"
+      when: wsrep_status.rc != 0
+
+- name: Check Garbd Status
+  hosts: garbd
+  become: true
+  gather_facts: false
+  tags: [summary, detailed]
+  when: garbd_enabled
+  tasks:
+    - name: Check garbd service
+      ansible.builtin.systemd:
+        name: garb
+      register: garbd_service
+      ignore_errors: true
+
+    - name: Set garbd status
+      ansible.builtin.set_fact:
+        garbd_status:
+          name: "{{ node_name }}"
+          ip: "{{ node_ip }}"
+          service: "{{ 'running' if garbd_service.status.ActiveState == 'active' else 'stopped' }}"
+
+- name: Check HAProxy Status
+  hosts: loadbalancers
+  become: true
+  gather_facts: false
+  tags: [summary, detailed, haproxy]
+  when: haproxy_nodes | length > 0
+  tasks:
+    - name: Check HAProxy service
+      ansible.builtin.systemd:
+        name: haproxy
+      register: haproxy_service
+      ignore_errors: true
+
+    - name: Check HAProxy port
+      ansible.builtin.wait_for:
+        port: "{{ mysql_port }}"
+        host: "{{ node_ip }}"
+        timeout: 5
+      register: haproxy_port_check
+      ignore_errors: true
+
+    - name: Set HAProxy status
+      ansible.builtin.set_fact:
+        haproxy_status:
+          name: "{{ node_name }}"
+          ip: "{{ node_ip }}"
+          service: "{{ 'running' if haproxy_service.status.ActiveState == 'active' else 'stopped' }}"
+          port: "{{ 'open' if haproxy_port_check is succeeded else 'closed' }}"
+
+- name: Display Status Summary
+  hosts: localhost
+  gather_facts: false
+  tags: [summary, detailed]
+  tasks:
+    - name: Display MariaDB nodes
+      ansible.builtin.debug:
+        msg: |
+          ============ MariaDB Galera Cluster Status ============
+          
+          MariaDB Data Nodes:
+          {% for host in groups['mariadb'] %}
+          {{ hostvars[host]['node_status']['name'] }} ({{ hostvars[host]['node_status']['ip'] }})
+            Service: {{ hostvars[host]['node_status']['service'] }} | Port: {{ hostvars[host]['node_status']['port'] }}
+            Cluster Size: {{ hostvars[host]['node_status']['cluster_size'] }} | Status: {{ hostvars[host]['node_status']['cluster_status'] }}
+            Node State: {{ hostvars[host]['node_status']['node_state'] }}
+            Ready: {{ hostvars[host]['node_status']['ready'] }} | Connected: {{ hostvars[host]['node_status']['connected'] }}
+          {% endfor %}
+
+    - name: Display Garbd nodes
+      ansible.builtin.debug:
+        msg: |
+          Galera Arbitrator Nodes:
+          {% for host in groups['garbd'] %}
+          {{ hostvars[host]['garbd_status']['name'] }} ({{ hostvars[host]['garbd_status']['ip'] }})
+            Service: {{ hostvars[host]['garbd_status']['service'] }}
+          {% endfor %}
+      when: garbd_enabled and groups['garbd'] | default([]) | length > 0
+
+    - name: Display HAProxy nodes
+      ansible.builtin.debug:
+        msg: |
+          HAProxy Load Balancers:
+          {% for host in groups['loadbalancers'] %}
+          {{ hostvars[host]['haproxy_status']['name'] }} ({{ hostvars[host]['haproxy_status']['ip'] }})
+            Service: {{ hostvars[host]['haproxy_status']['service'] }} | Port: {{ hostvars[host]['haproxy_status']['port'] }}
+          {% if haproxy_stats_enabled %}  Stats: http://{{ hostvars[host]['haproxy_status']['ip'] }}:{{ haproxy_stats_port }}/stats{% endif %}
+          {% endfor %}
+      when: haproxy_nodes | length > 0
+
+    - name: Display connection info
+      ansible.builtin.debug:
+        msg: |
+          ============ Connection Endpoints ============
+          {% if haproxy_nodes | length > 0 %}
+          {% for node in haproxy_nodes %}
+          mysql -h {{ node.ip }} -u {{ admin_user }} -p
+          {% endfor %}
+          {% else %}
+          {% for node in mariadb_nodes %}
+          mysql -h {{ node.ip }} -u {{ admin_user }} -p
+          {% endfor %}
+          {% endif %}
+
+- name: Detailed Node Status
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [detailed]
+  tasks:
+    - name: Get full wsrep status
+      ansible.builtin.shell: |
+        mariadb -u {{ admin_user }} -p'{{ admin_password }}' -e "SHOW STATUS LIKE 'wsrep_%';" 2>/dev/null
+      register: full_wsrep_status
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Display full status
+      ansible.builtin.debug:
+        msg: |
+          ============ {{ node_name }} ({{ node_ip }}) ============
+          {{ full_wsrep_status.stdout }}
+      when: full_wsrep_status.rc == 0

@@ -1,0 +1,189 @@
+---
+- name: Build Dynamic Inventory
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Add MariaDB nodes
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        groups: mariadb
+        server_id: "{{ idx + 1 }}"
+        node_ip: "{{ item.ip }}"
+        node_name: "{{ item.name }}"
+      loop: "{{ mariadb_nodes }}"
+      loop_control:
+        index_var: idx
+
+    - name: Add Garbd nodes
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        groups: garbd
+        node_ip: "{{ item.ip }}"
+        node_name: "{{ item.name }}"
+      loop: "{{ garbd_nodes }}"
+      when: garbd_enabled and garbd_nodes | length > 0
+
+- name: Confirm Recovery
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Display warning
+      ansible.builtin.debug:
+        msg: |
+          WARNING: CLUSTER RECOVERY
+          This will stop all services and bootstrap from most up-to-date node.
+
+    - name: Confirm
+      ansible.builtin.pause:
+        prompt: "Press ENTER to continue or Ctrl+C to abort"
+
+- name: Stop All Services
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Stop MariaDB
+      ansible.builtin.systemd:
+        name: mariadb
+        state: stopped
+      ignore_errors: true
+
+- name: Stop Garbd Services
+  hosts: garbd
+  become: true
+  gather_facts: false
+  when: garbd_enabled
+  tasks:
+    - name: Stop garbd
+      ansible.builtin.systemd:
+        name: garb
+        state: stopped
+      ignore_errors: true
+
+- name: Find Most Advanced Node
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read grastate.dat
+      ansible.builtin.slurp:
+        src: "{{ mysql_data_dir }}/grastate.dat"
+      register: grastate_content
+      ignore_errors: true
+
+    - name: Parse seqno
+      ansible.builtin.set_fact:
+        node_seqno: "{{ (grastate_content.content | b64decode | regex_search('seqno:\\s*(-?\\d+)', '\\1'))[0] | default('-1') }}"
+      when: grastate_content is succeeded
+
+    - name: Set default seqno
+      ansible.builtin.set_fact:
+        node_seqno: "-1"
+      when: grastate_content is failed
+
+    - name: Display node status
+      ansible.builtin.debug:
+        msg: "Node {{ node_name }}: seqno={{ node_seqno }}"
+
+- name: Determine Bootstrap Node
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Collect seqno from all nodes
+      ansible.builtin.set_fact:
+        node_seqnos: "{{ node_seqnos | default({}) | combine({item: hostvars[item]['node_seqno'] | int}) }}"
+      loop: "{{ groups['mariadb'] }}"
+
+    - name: Find node with highest seqno
+      ansible.builtin.set_fact:
+        bootstrap_node: "{{ node_seqnos | dict2items | sort(attribute='value', reverse=true) | first }}"
+
+    - name: Display selection
+      ansible.builtin.debug:
+        msg: "Bootstrap node: {{ bootstrap_node.key }} (seqno: {{ bootstrap_node.value }})"
+
+    - name: Set bootstrap node fact
+      ansible.builtin.set_fact:
+        selected_bootstrap_node: "{{ bootstrap_node.key }}"
+
+- name: Prepare Bootstrap Node
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Check if bootstrap node
+      ansible.builtin.set_fact:
+        is_bootstrap: "{{ inventory_hostname == hostvars['localhost']['selected_bootstrap_node'] }}"
+
+    - name: Set safe_to_bootstrap flag
+      ansible.builtin.lineinfile:
+        path: "{{ mysql_data_dir }}/grastate.dat"
+        regexp: "^safe_to_bootstrap:"
+        line: "safe_to_bootstrap: 1"
+      when: is_bootstrap
+
+- name: Bootstrap Cluster
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Bootstrap cluster
+      ansible.builtin.command: galera_new_cluster
+      when: hostvars[inventory_hostname]['is_bootstrap'] | default(false)
+
+    - name: Wait for bootstrap node
+      ansible.builtin.wait_for:
+        port: "{{ mysql_port }}"
+        host: "{{ node_ip }}"
+        delay: 5
+        timeout: 120
+      when: hostvars[inventory_hostname]['is_bootstrap'] | default(false)
+
+    - name: Start MariaDB on other nodes
+      ansible.builtin.systemd:
+        name: mariadb
+        state: started
+      when: not (hostvars[inventory_hostname]['is_bootstrap'] | default(false))
+
+    - name: Wait for sync
+      ansible.builtin.shell: |
+        mariadb -u root -p'{{ mariadb_root_password }}' -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | grep -i synced
+      when: not (hostvars[inventory_hostname]['is_bootstrap'] | default(false))
+      register: sync_status
+      until: sync_status.rc == 0
+      retries: 60
+      delay: 10
+      changed_when: false
+      no_log: true
+
+- name: Restart Garbd
+  hosts: garbd
+  become: true
+  gather_facts: false
+  when: garbd_enabled
+  tasks:
+    - name: Start garbd
+      ansible.builtin.systemd:
+        name: garb
+        state: started
+
+- name: Verify Recovery
+  hosts: mariadb[0]
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Get cluster size
+      ansible.builtin.shell: |
+        mariadb -u root -p'{{ mariadb_root_password }}' -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | tail -1 | awk '{print $2}'
+      register: final_cluster_size
+      no_log: true
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg: |
+          Recovery Complete!
+          Cluster Size: {{ final_cluster_size.stdout }}
+          Expected: {{ mariadb_nodes | length }}

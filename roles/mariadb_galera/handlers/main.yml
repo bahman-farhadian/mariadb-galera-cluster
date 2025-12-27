@@ -1,0 +1,63 @@
+---
+- name: Restart mariadb rolling
+  block:
+    - name: Check if cluster is running
+      ansible.builtin.shell: |
+        mariadb -u root -p'{{ mariadb_root_password }}' -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | grep -oP '\d+' || echo "0"
+      register: cluster_running
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Restart MariaDB (non-cluster mode)
+      ansible.builtin.systemd:
+        name: mariadb
+        state: restarted
+      when: cluster_running.stdout | int < 2
+
+    - name: Rolling restart MariaDB (cluster mode)
+      when: cluster_running.stdout | int >= 2
+      block:
+        - name: Set node to desync mode
+          ansible.builtin.shell: |
+            mariadb -u root -p'{{ mariadb_root_password }}' -e "SET GLOBAL wsrep_desync = ON;"
+          no_log: true
+          ignore_errors: true
+
+        - name: Restart MariaDB service
+          ansible.builtin.systemd:
+            name: mariadb
+            state: restarted
+
+        - name: Wait for MariaDB to be ready
+          ansible.builtin.wait_for:
+            port: "{{ mysql_port }}"
+            host: "{{ node_ip }}"
+            delay: 5
+            timeout: 120
+
+        - name: Wait for node to sync
+          ansible.builtin.shell: |
+            mariadb -u root -p'{{ mariadb_root_password }}' -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | grep -i synced
+          register: sync_status
+          until: sync_status.rc == 0
+          retries: 60
+          delay: 5
+          changed_when: false
+          no_log: true
+
+        - name: Disable desync mode
+          ansible.builtin.shell: |
+            mariadb -u root -p'{{ mariadb_root_password }}' -e "SET GLOBAL wsrep_desync = OFF;"
+          no_log: true
+          ignore_errors: true
+
+        - name: Pause between node restarts
+          ansible.builtin.pause:
+            seconds: 10
+  listen: Restart mariadb rolling
+
+- name: Reload mariadb
+  ansible.builtin.systemd:
+    name: mariadb
+    state: reloaded
