@@ -9,6 +9,7 @@ Production-ready Ansible automation for deploying highly available MariaDB Galer
 - **Load balancing**: Optional HAProxy with stats dashboard
 - **Arbitrator support**: Optional Garbd for even-numbered setups
 - **Single playbook**: All operations in one `mariadb.yml` with tags
+- **Parallel execution**: Fast deployment with parallel install/configure
 - **Automated recovery**: One-command cluster recovery
 
 ## Quick Start
@@ -35,6 +36,22 @@ ansible-playbook mariadb.yml --tags deploy
 | `ansible-playbook mariadb.yml --tags status` | Check cluster status |
 | `ansible-playbook mariadb.yml --tags status-detailed` | Detailed per-node status |
 | `ansible-playbook mariadb.yml --tags recover` | Recover from cluster failure |
+
+## Execution Flow
+
+The playbook is optimized for speed with parallel execution where safe:
+
+```
+PARALLEL:  Prepare all remote hosts
+PARALLEL:  Install MariaDB packages (all nodes simultaneously)
+PARALLEL:  Configure MariaDB (all nodes simultaneously)
+PARALLEL:  Stop MariaDB (all nodes)
+SEQUENTIAL: Bootstrap first node
+SEQUENTIAL: Join remaining nodes (one by one for safe sync)
+SEQUENTIAL: Secure cluster
+PARALLEL:  Deploy HAProxy (all LBs simultaneously)
+PARALLEL:  Deploy Garbd (if enabled)
+```
 
 ## Configuration
 
@@ -133,16 +150,17 @@ SHOW STATUS LIKE 'wsrep_ready';             -- Should be 'ON'
 
 ```
 mariadb-galera-cluster/
-├── mariadb.yml              # Main playbook (all operations)
+├── mariadb.yml           # Main playbook (all operations)
 ├── ansible.cfg           # Ansible configuration
 ├── requirements.yml      # Ansible Galaxy dependencies
 ├── group_vars/
 │   └── all.yml           # Cluster configuration
 ├── inventory/
 │   └── hosts.yml         # SSH settings
-└── roles/
-    ├── mariadb_galera/   # MariaDB + Galera role
-    └── haproxy/          # HAProxy role
+└── templates/
+    ├── 60-galera.cnf.j2  # Galera configuration
+    ├── garb.j2           # Garbd configuration
+    └── haproxy.cfg.j2    # HAProxy configuration
 ```
 
 ## License

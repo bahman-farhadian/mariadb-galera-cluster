@@ -1,6 +1,6 @@
 ---
 # =============================================================================
-# MariaDB Galera Cluster - Unified Playbook
+# MariaDB Galera Cluster - Unified Playbook (Optimized Parallel Execution)
 # =============================================================================
 #
 # USAGE:
@@ -83,10 +83,11 @@
           HAProxy: {{ haproxy_nodes | length }} nodes
           Garbd: {{ 'enabled' if garbd_enabled else 'disabled' }}
           SST: {{ sst_method }}
+          Mode: Parallel install/configure, sequential cluster start
           ============================================
 
 # =============================================================================
-# DEPLOY: Prepare Remote Hosts
+# DEPLOY: Prepare All Remote Hosts (PARALLEL)
 # =============================================================================
 - name: Prepare Remote Hosts
   hosts: mariadb:loadbalancers:garbd
@@ -99,17 +100,117 @@
       changed_when: false
 
 # =============================================================================
-# DEPLOY: MariaDB Galera Nodes
+# DEPLOY: Install MariaDB on All Nodes (PARALLEL)
 # =============================================================================
-- name: Deploy MariaDB Galera Cluster
+- name: Install MariaDB Packages
   hosts: mariadb
   become: true
   gather_facts: true
-  serial: 1
   tags: [deploy, deploy-mariadb]
-  roles:
-    - mariadb_galera
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
 
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        upgrade: safe
+
+    - name: Install MariaDB and Galera packages
+      ansible.builtin.apt:
+        name:
+          - mariadb-server
+          - galera-4
+          - python3-pymysql
+          - rsync
+        state: present
+
+    - name: Install mariabackup (if SST method is mariabackup)
+      ansible.builtin.apt:
+        name: mariadb-backup
+        state: present
+      when: sst_method == "mariabackup"
+
+    - name: Create MySQL log directory
+      ansible.builtin.file:
+        path: "{{ mysql_log_dir }}"
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: "0750"
+
+    - name: Ensure MySQL data directory has correct permissions
+      ansible.builtin.file:
+        path: "{{ mysql_data_dir }}"
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: "0750"
+
+# =============================================================================
+# DEPLOY: Configure All Nodes (PARALLEL)
+# =============================================================================
+- name: Configure MariaDB Galera
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [deploy, deploy-mariadb]
+  tasks:
+    - name: Stop MariaDB before configuration
+      ansible.builtin.systemd:
+        name: mariadb
+        state: stopped
+      ignore_errors: true
+
+    - name: Configure MariaDB to listen on all interfaces
+      ansible.builtin.lineinfile:
+        path: "{{ mysql_conf_dir }}/50-server.cnf"
+        regexp: "^bind-address"
+        line: "bind-address = 0.0.0.0"
+        backup: true
+
+    - name: Deploy Galera configuration
+      ansible.builtin.template:
+        src: templates/60-galera.cnf.j2
+        dest: "{{ mysql_conf_dir }}/60-galera.cnf"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+
+    - name: Create grastate.dat marker to prevent unsafe bootstrap
+      ansible.builtin.copy:
+        content: |
+          # GALERA saved state
+          version: 2.1
+          uuid: 00000000-0000-0000-0000-000000000000
+          seqno: -1
+          safe_to_bootstrap: 0
+        dest: "{{ mysql_data_dir }}/grastate.dat"
+        owner: mysql
+        group: mysql
+        mode: "0644"
+        force: false
+
+# =============================================================================
+# DEPLOY: Stop All Nodes Before Bootstrap (PARALLEL)
+# =============================================================================
+- name: Stop All MariaDB Nodes
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [deploy, deploy-mariadb]
+  tasks:
+    - name: Ensure MariaDB is stopped on all nodes
+      ansible.builtin.systemd:
+        name: mariadb
+        state: stopped
+      ignore_errors: true
+
+# =============================================================================
+# DEPLOY: Bootstrap First Node (SEQUENTIAL - Required)
+# =============================================================================
 - name: Bootstrap Galera Cluster
   hosts: mariadb[0]
   become: true
@@ -126,12 +227,6 @@
     - name: Bootstrap cluster if not running
       when: cluster_size_check.stdout | int < 1
       block:
-        - name: Stop MariaDB
-          ansible.builtin.systemd:
-            name: mariadb
-            state: stopped
-          ignore_errors: true
-
         - name: Set safe_to_bootstrap flag
           ansible.builtin.lineinfile:
             path: "{{ mysql_data_dir }}/grastate.dat"
@@ -148,6 +243,9 @@
             delay: 5
             timeout: 60
 
+# =============================================================================
+# DEPLOY: Start Remaining Nodes (SEQUENTIAL - Required for SST)
+# =============================================================================
 - name: Start Remaining MariaDB Nodes
   hosts: mariadb[1:]
   become: true
@@ -161,7 +259,7 @@
         state: started
         enabled: true
 
-    - name: Wait for sync
+    - name: Wait for node to sync
       ansible.builtin.shell: |
         mariadb -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | grep -i synced
       register: sync_status
@@ -170,6 +268,9 @@
       delay: 10
       changed_when: false
 
+# =============================================================================
+# DEPLOY: Secure Cluster
+# =============================================================================
 - name: Secure Cluster
   hosts: mariadb[0]
   become: true
@@ -231,7 +332,7 @@
       no_log: true
 
 # =============================================================================
-# DEPLOY: Galera Arbitrator (optional)
+# DEPLOY: Galera Arbitrator (PARALLEL)
 # =============================================================================
 - name: Deploy Galera Arbitrator
   hosts: garbd
@@ -239,10 +340,6 @@
   gather_facts: true
   tags: [deploy, deploy-garbd]
   tasks:
-    - name: Ensure Ansible temp directory exists
-      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
-      changed_when: false
-
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
@@ -255,7 +352,7 @@
 
     - name: Configure Galera Arbitrator
       ansible.builtin.template:
-        src: roles/mariadb_galera/templates/garb.j2
+        src: templates/garb.j2
         dest: /etc/default/garb
         mode: "0644"
 
@@ -266,16 +363,50 @@
         enabled: true
 
 # =============================================================================
-# DEPLOY: HAProxy Load Balancers
+# DEPLOY: HAProxy Load Balancers (PARALLEL)
 # =============================================================================
 - name: Deploy HAProxy Load Balancers
   hosts: loadbalancers
   become: true
   gather_facts: true
-  serial: 1
   tags: [deploy, deploy-haproxy]
-  roles:
-    - haproxy
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install HAProxy
+      ansible.builtin.apt:
+        name: haproxy
+        state: present
+
+    - name: Deploy HAProxy configuration
+      ansible.builtin.template:
+        src: templates/haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+        validate: "haproxy -c -f %s"
+
+    - name: Restart and enable HAProxy
+      ansible.builtin.systemd:
+        name: haproxy
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Wait for HAProxy to start
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Verify HAProxy is listening on MySQL port
+      ansible.builtin.shell: ss -tlnp | grep ":{{ mysql_port }}"
+      register: haproxy_mysql_check
+      changed_when: false
+      failed_when: haproxy_mysql_check.rc != 0
 
 # =============================================================================
 # DEPLOY: Verification
@@ -309,7 +440,7 @@
           ============================================
 
 # =============================================================================
-# STATUS: Check Cluster Status
+# STATUS: Check Cluster Status (PARALLEL)
 # =============================================================================
 - name: Prepare for Status Check
   hosts: mariadb:loadbalancers:garbd
@@ -499,6 +630,9 @@
       ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
       changed_when: false
 
+# =============================================================================
+# RECOVER: Stop All Services (PARALLEL)
+# =============================================================================
 - name: Stop All Services
   hosts: mariadb
   become: true
@@ -523,6 +657,9 @@
         state: stopped
       ignore_errors: true
 
+# =============================================================================
+# RECOVER: Find Most Recent Node (PARALLEL)
+# =============================================================================
 - name: Find Most Recent Node
   hosts: mariadb
   become: true
@@ -588,6 +725,9 @@
         line: "safe_to_bootstrap: 1"
       when: is_bootstrap
 
+# =============================================================================
+# RECOVER: Bootstrap and Rejoin (SEQUENTIAL - Required)
+# =============================================================================
 - name: Bootstrap and Rejoin Cluster
   hosts: mariadb
   become: true
