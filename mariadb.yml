@@ -106,10 +106,14 @@
 
     - name: Check wsrep cluster status
       ansible.builtin.shell: |
-        mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null || echo "0"
+        # Try socket auth first, then with password
+        mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null \
+        || mariadb -u {{ admin_user }} -p'{{ admin_password }}' -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null \
+        || echo "0"
       register: wsrep_size
       changed_when: false
       failed_when: false
+      no_log: true
       when: mariadb_active.rc == 0
 
     - name: Set node state
@@ -302,9 +306,10 @@
 
         - name: Wait for sync
           ansible.builtin.shell: |
-            for i in $(seq 1 30); do
-              mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment';" 2>/dev/null | grep -qi synced && exit 0
-              sleep 5
+            for i in $(seq 1 60); do
+              # Check journal for sync message (works without DB auth)
+              journalctl -u mariadb --no-pager -n 50 2>/dev/null | grep -qi "synced with group" && exit 0
+              sleep 3
             done
             exit 1
           changed_when: false
@@ -332,9 +337,10 @@
 
         - name: Wait for sync
           ansible.builtin.shell: |
-            for i in $(seq 1 30); do
-              mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment';" 2>/dev/null | grep -qi synced && exit 0
-              sleep 5
+            for i in $(seq 1 60); do
+              # Check journal for sync message
+              journalctl -u mariadb --no-pager -n 50 2>/dev/null | grep -qi "synced with group" && exit 0
+              sleep 3
             done
             exit 1
           changed_when: false
@@ -833,8 +839,8 @@
         - name: Wait for sync
           ansible.builtin.shell: |
             for i in $(seq 1 60); do
-              mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment';" 2>/dev/null | grep -qi synced && exit 0
-              sleep 5
+              journalctl -u mariadb --no-pager -n 50 2>/dev/null | grep -qi "synced with group" && exit 0
+              sleep 3
             done
             exit 1
           changed_when: false
@@ -860,9 +866,12 @@
   tasks:
     - name: Get cluster size
       ansible.builtin.shell: |
-        mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null || echo "0"
+        mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null \
+        || mariadb -u {{ admin_user }} -p'{{ admin_password }}' -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null \
+        || echo "0"
       register: size
       changed_when: false
+      no_log: true
       when: confirm | default(false) | bool
 
     - name: Display result
