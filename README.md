@@ -9,9 +9,9 @@ Production-ready Ansible automation for deploying highly available MariaDB Galer
 - **Load balancing**: Optional HAProxy with stats dashboard
 - **Arbitrator support**: Optional Garbd for even-numbered setups
 - **Single playbook**: All operations in one `mariadb.yml` with tags
-- **Idempotent**: Safe to run multiple times - detects existing cluster state
+- **Idempotent**: Safe to run multiple times - auto-detects cluster state
 - **Parallel execution**: Fast deployment with parallel install/configure
-- **Automated recovery**: One-command cluster recovery
+- **CLI switches**: No interactive prompts - all options via command line
 
 ## Quick Start
 
@@ -19,39 +19,49 @@ Production-ready Ansible automation for deploying highly available MariaDB Galer
 # 1. Install required Ansible collection
 ansible-galaxy collection install -r requirements.yml
 
-# 2. Configure your cluster in group_vars/all.yml
+# 2. Configure your cluster
 vim group_vars/all.yml
 
-# 3. Deploy the cluster
+# 3. Deploy
 ansible-playbook mariadb.yml --tags deploy
 ```
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `ansible-playbook mariadb.yml --tags deploy` | Deploy full cluster (MariaDB + HAProxy) |
-| `ansible-playbook mariadb.yml --tags deploy-mariadb` | Deploy MariaDB nodes only |
-| `ansible-playbook mariadb.yml --tags deploy-haproxy` | Deploy HAProxy load balancers only |
-| `ansible-playbook mariadb.yml --tags deploy-garbd` | Deploy Galera Arbitrator only |
-| `ansible-playbook mariadb.yml --tags status` | Check cluster status |
-| `ansible-playbook mariadb.yml --tags status-detailed` | Detailed per-node status |
-| `ansible-playbook mariadb.yml --tags recover` | Recover from cluster failure |
+### Deploy
 
-## Execution Flow
+```bash
+# Deploy full cluster (MariaDB + HAProxy + Garbd)
+ansible-playbook mariadb.yml --tags deploy
 
-The playbook is optimized for speed with parallel execution where safe:
+# Deploy MariaDB nodes only
+ansible-playbook mariadb.yml --tags deploy-mariadb
 
+# Deploy HAProxy load balancers only
+ansible-playbook mariadb.yml --tags deploy-haproxy
+
+# Deploy Galera Arbitrator only
+ansible-playbook mariadb.yml --tags deploy-garbd
+
+# Force fresh bootstrap (WARNING: destroys existing cluster)
+ansible-playbook mariadb.yml --tags deploy -e force_bootstrap=yes
 ```
-PARALLEL:  Prepare all remote hosts
-PARALLEL:  Install MariaDB packages (all nodes simultaneously)
-PARALLEL:  Configure MariaDB (all nodes simultaneously)
-PARALLEL:  Stop MariaDB (all nodes)
-SEQUENTIAL: Bootstrap first node
-SEQUENTIAL: Join remaining nodes (one by one for safe sync)
-SEQUENTIAL: Secure cluster
-PARALLEL:  Deploy HAProxy (all LBs simultaneously)
-PARALLEL:  Deploy Garbd (if enabled)
+
+### Status
+
+```bash
+# Quick cluster status
+ansible-playbook mariadb.yml --tags status
+
+# Detailed per-node wsrep status
+ansible-playbook mariadb.yml --tags status-detailed
+```
+
+### Recovery
+
+```bash
+# Recover from complete cluster failure
+ansible-playbook mariadb.yml --tags recover -e confirm=yes
 ```
 
 ## Configuration
@@ -59,109 +69,133 @@ PARALLEL:  Deploy Garbd (if enabled)
 Edit `group_vars/all.yml`:
 
 ```yaml
+# Cluster name
+cluster_name: "production_cluster"
+
 # MariaDB nodes (use ODD number: 3, 5, 7...)
 mariadb_nodes:
   - { ip: "192.168.1.10", name: "mariadb-node-1" }
   - { ip: "192.168.1.11", name: "mariadb-node-2" }
   - { ip: "192.168.1.12", name: "mariadb-node-3" }
 
-# HAProxy load balancers (optional, set to [] to disable)
+# HAProxy load balancers (optional - set to [] to disable)
 haproxy_nodes:
   - { ip: "192.168.1.20", name: "mariadb-lb-1" }
   - { ip: "192.168.1.21", name: "mariadb-lb-2" }
 
-# Galera Arbitrator (optional, for even node counts)
+# Galera Arbitrator (optional - for even node counts)
 garbd_enabled: false
 garbd_nodes: []
 
 # Credentials (CHANGE THESE!)
-mariadb_root_password: "YourSecurePassword"
+mariadb_root_password: "YourSecureRootPassword"
 admin_user: "admin"
-admin_password: "YourSecurePassword"
+admin_password: "YourSecureAdminPassword"
+
+# HAProxy stats
+haproxy_stats_enabled: true
+haproxy_stats_port: 8404
+haproxy_stats_user: "admin"
+haproxy_stats_password: "YourStatsPassword"
 ```
+
+## Idempotency Behavior
+
+| Current State | Action | Result |
+|---------------|--------|--------|
+| No cluster | `--tags deploy` | Fresh install + bootstrap |
+| Running cluster | `--tags deploy` | Verify config, rolling restart if changed |
+| Running cluster | `--tags deploy -e force_bootstrap=yes` | **DESTROYS** and recreates |
+| Failed cluster | `--tags recover -e confirm=yes` | Find best node, bootstrap, rejoin |
 
 ## Node Count Guidelines
 
 | Data Nodes | Garbd | Total Voters | Tolerates |
 |------------|-------|--------------|-----------|
 | 3 | No | 3 | 1 failure |
-| 4 | Yes (1) | 5 | 2 failures |
+| 4 | Yes | 5 | 2 failures |
 | 5 | No | 5 | 2 failures |
 | 7 | No | 7 | 3 failures |
 
-**Rule**: Always maintain an ODD number of voters to prevent split-brain.
+**Rule**: Always maintain an ODD number of voters.
 
 ## Network Ports
 
 | Port | Service |
 |------|---------|
-| 3306 | MySQL client connections |
-| 4567 | Galera cluster replication |
+| 3306 | MySQL client |
+| 4567 | Galera replication |
 | 4568 | IST / Garbd |
-| 4444 | SST (State Snapshot Transfer) |
-| 8404 | HAProxy stats dashboard |
+| 4444 | SST |
+| 8404 | HAProxy stats |
 
-## Connecting to the Cluster
+## Connecting
 
 ```bash
 # Via HAProxy (recommended)
 mysql -h <haproxy-ip> -u admin -p
 
-# Direct to any node
+# Direct to node
 mysql -h <node-ip> -u admin -p
 ```
 
-## HAProxy Stats Dashboard
+## HAProxy Stats
 
-Access at: `http://<haproxy-ip>:8404/stats`
-
-Default credentials (change in `group_vars/all.yml`):
-- Username: `admin`
-- Password: `ChangeMe_StatsPassword123!`
+- URL: `http://<haproxy-ip>:8404/stats`
+- Credentials: Set in `group_vars/all.yml`
 
 ## Recovery
 
 ### Single Node Failure
-No action needed. The node will automatically rejoin when restarted:
+
+Node auto-rejoins on restart:
 ```bash
 systemctl start mariadb
 ```
 
 ### Complete Cluster Failure
+
 ```bash
-ansible-playbook mariadb.yml --tags recover
+ansible-playbook mariadb.yml --tags recover -e confirm=yes
 ```
+
 This will:
 1. Stop all services
-2. Find the most up-to-date node (highest seqno)
+2. Find node with highest seqno
 3. Bootstrap from that node
-4. Rejoin all other nodes
+4. Rejoin remaining nodes
 
 ## Monitoring
 
-Key metrics to watch:
 ```sql
-SHOW STATUS LIKE 'wsrep_cluster_size';      -- Should match node count
-SHOW STATUS LIKE 'wsrep_cluster_status';    -- Should be 'Primary'
-SHOW STATUS LIKE 'wsrep_local_state_comment'; -- Should be 'Synced'
-SHOW STATUS LIKE 'wsrep_ready';             -- Should be 'ON'
+-- Cluster size (should match node count)
+SHOW STATUS LIKE 'wsrep_cluster_size';
+
+-- Cluster status (should be 'Primary')
+SHOW STATUS LIKE 'wsrep_cluster_status';
+
+-- Node state (should be 'Synced')
+SHOW STATUS LIKE 'wsrep_local_state_comment';
+
+-- Ready for queries (should be 'ON')
+SHOW STATUS LIKE 'wsrep_ready';
 ```
 
 ## File Structure
 
 ```
 mariadb-galera-cluster/
-├── mariadb.yml           # Main playbook (all operations)
-├── ansible.cfg           # Ansible configuration
-├── requirements.yml      # Ansible Galaxy dependencies
+├── mariadb.yml           # Main playbook
+├── ansible.cfg           # Ansible config
+├── requirements.yml      # Galaxy dependencies
 ├── group_vars/
-│   └── all.yml           # Cluster configuration
+│   └── all.yml           # Cluster config
 ├── inventory/
 │   └── hosts.yml         # SSH settings
 └── templates/
-    ├── 60-galera.cnf.j2  # Galera configuration
-    ├── garb.j2           # Garbd configuration
-    └── haproxy.cfg.j2    # HAProxy configuration
+    ├── 60-galera.cnf.j2  # Galera config
+    ├── haproxy.cfg.j2    # HAProxy config
+    └── garb.j2           # Garbd config
 ```
 
 ## License
