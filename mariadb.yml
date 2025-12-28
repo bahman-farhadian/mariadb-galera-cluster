@@ -1,6 +1,6 @@
 ---
 # =============================================================================
-# MariaDB Galera Cluster - Unified Playbook (Optimized Parallel Execution)
+# MariaDB Galera Cluster - Unified Playbook (Idempotent + Parallel)
 # =============================================================================
 #
 # USAGE:
@@ -12,10 +12,16 @@
 #   Detailed status:         ansible-playbook mariadb.yml --tags status-detailed
 #   Recover cluster:         ansible-playbook mariadb.yml --tags recover
 #
+# IDEMPOTENCY:
+#   - Safe to run multiple times on existing cluster
+#   - Detects running cluster and skips destructive operations
+#   - Only bootstraps if no cluster exists
+#   - Only restarts services if config changes
+#
 # =============================================================================
 
 # =============================================================================
-# COMMON: Build Dynamic Inventory (runs for all operations)
+# COMMON: Build Dynamic Inventory
 # =============================================================================
 - name: Build Dynamic Inventory
   hosts: localhost
@@ -65,14 +71,65 @@
       when: garbd_enabled and garbd_nodes | length > 0
 
 # =============================================================================
-# DEPLOY: Display Summary
+# DEPLOY: Prepare Remote Hosts (PARALLEL)
 # =============================================================================
-- name: Deployment Summary
+- name: Prepare Remote Hosts
+  hosts: mariadb:loadbalancers:garbd
+  become: true
+  gather_facts: false
+  tags: [deploy, deploy-mariadb, deploy-haproxy, deploy-garbd, status, status-detailed, recover]
+  tasks:
+    - name: Ensure Ansible temp directory exists
+      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
+      changed_when: false
+
+# =============================================================================
+# DEPLOY: Check Existing Cluster State (PARALLEL)
+# =============================================================================
+- name: Check Existing Cluster State
+  hosts: mariadb
+  become: true
+  gather_facts: true
+  tags: [deploy, deploy-mariadb]
+  tasks:
+    - name: Check if MariaDB is installed
+      ansible.builtin.shell: dpkg -l | grep -q mariadb-server && echo "installed" || echo "not_installed"
+      register: mariadb_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Check if MariaDB service is running
+      ansible.builtin.shell: systemctl is-active mariadb 2>/dev/null || echo "inactive"
+      register: mariadb_running
+      changed_when: false
+      failed_when: false
+
+    - name: Check cluster membership
+      ansible.builtin.shell: |
+        mariadb -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | grep -oP '\d+' || echo "0"
+      register: cluster_size
+      changed_when: false
+      failed_when: false
+      when: mariadb_running.stdout == "active"
+
+    - name: Set node state facts
+      ansible.builtin.set_fact:
+        node_is_installed: "{{ mariadb_installed.stdout == 'installed' }}"
+        node_is_running: "{{ mariadb_running.stdout == 'active' }}"
+        node_cluster_size: "{{ cluster_size.stdout | default('0') | int }}"
+        node_in_cluster: "{{ (cluster_size.stdout | default('0') | int) > 0 }}"
+
+- name: Determine Cluster State
   hosts: localhost
   gather_facts: false
-  tags: [deploy, deploy-mariadb, deploy-haproxy, deploy-garbd]
+  tags: [deploy, deploy-mariadb]
   tasks:
-    - name: Display deployment summary
+    - name: Check if any node is in a running cluster
+      ansible.builtin.set_fact:
+        cluster_exists: "{{ groups['mariadb'] | map('extract', hostvars) | selectattr('node_in_cluster', 'defined') | selectattr('node_in_cluster', 'equalto', true) | list | length > 0 }}"
+        all_nodes_installed: "{{ groups['mariadb'] | map('extract', hostvars) | selectattr('node_is_installed', 'defined') | selectattr('node_is_installed', 'equalto', true) | list | length == groups['mariadb'] | length }}"
+
+    - name: Display cluster state
       ansible.builtin.debug:
         msg: |
           ============================================
@@ -83,39 +140,26 @@
           HAProxy: {{ haproxy_nodes | length }} nodes
           Garbd: {{ 'enabled' if garbd_enabled else 'disabled' }}
           SST: {{ sst_method }}
-          Mode: Parallel install/configure, sequential cluster start
+          --------------------------------------------
+          Cluster Already Exists: {{ cluster_exists }}
+          All Nodes Installed: {{ all_nodes_installed }}
+          Mode: {{ 'Update existing cluster' if cluster_exists else 'Fresh installation' }}
           ============================================
 
 # =============================================================================
-# DEPLOY: Prepare All Remote Hosts (PARALLEL)
-# =============================================================================
-- name: Prepare Remote Hosts
-  hosts: mariadb:loadbalancers:garbd
-  become: true
-  gather_facts: false
-  tags: [deploy, deploy-mariadb, deploy-haproxy, deploy-garbd]
-  tasks:
-    - name: Ensure Ansible temp directory exists
-      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
-      changed_when: false
-
-# =============================================================================
-# DEPLOY: Install MariaDB on All Nodes (PARALLEL)
+# DEPLOY: Install MariaDB (PARALLEL) - Only if not installed
 # =============================================================================
 - name: Install MariaDB Packages
   hosts: mariadb
   become: true
-  gather_facts: true
+  gather_facts: false
   tags: [deploy, deploy-mariadb]
   tasks:
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
-
-    - name: Upgrade all packages
-      ansible.builtin.apt:
-        upgrade: safe
+      when: not node_is_installed
 
     - name: Install MariaDB and Galera packages
       ansible.builtin.apt:
@@ -125,12 +169,13 @@
           - python3-pymysql
           - rsync
         state: present
+      when: not node_is_installed
 
     - name: Install mariabackup (if SST method is mariabackup)
       ansible.builtin.apt:
         name: mariadb-backup
         state: present
-      when: sst_method == "mariabackup"
+      when: not node_is_installed and sst_method == "mariabackup"
 
     - name: Create MySQL log directory
       ansible.builtin.file:
@@ -149,7 +194,7 @@
         mode: "0750"
 
 # =============================================================================
-# DEPLOY: Configure All Nodes (PARALLEL)
+# DEPLOY: Configure Galera (PARALLEL) - Idempotent config deployment
 # =============================================================================
 - name: Configure MariaDB Galera
   hosts: mariadb
@@ -157,18 +202,13 @@
   gather_facts: false
   tags: [deploy, deploy-mariadb]
   tasks:
-    - name: Stop MariaDB before configuration
-      ansible.builtin.systemd:
-        name: mariadb
-        state: stopped
-      ignore_errors: true
-
     - name: Configure MariaDB to listen on all interfaces
       ansible.builtin.lineinfile:
         path: "{{ mysql_conf_dir }}/50-server.cnf"
         regexp: "^bind-address"
         line: "bind-address = 0.0.0.0"
         backup: true
+      register: bind_config
 
     - name: Deploy Galera configuration
       ansible.builtin.template:
@@ -178,8 +218,13 @@
         group: root
         mode: "0644"
         backup: true
+      register: galera_config
 
-    - name: Create grastate.dat marker to prevent unsafe bootstrap
+    - name: Set config changed fact
+      ansible.builtin.set_fact:
+        config_changed: "{{ bind_config.changed or galera_config.changed }}"
+
+    - name: Create grastate.dat marker (only if not exists)
       ansible.builtin.copy:
         content: |
           # GALERA saved state
@@ -194,39 +239,27 @@
         force: false
 
 # =============================================================================
-# DEPLOY: Stop All Nodes Before Bootstrap (PARALLEL)
+# DEPLOY: Fresh Install - Bootstrap New Cluster
 # =============================================================================
-- name: Stop All MariaDB Nodes
-  hosts: mariadb
-  become: true
-  gather_facts: false
-  tags: [deploy, deploy-mariadb]
-  tasks:
-    - name: Ensure MariaDB is stopped on all nodes
-      ansible.builtin.systemd:
-        name: mariadb
-        state: stopped
-      ignore_errors: true
-
-# =============================================================================
-# DEPLOY: Bootstrap First Node (SEQUENTIAL - Required)
-# =============================================================================
-- name: Bootstrap Galera Cluster
+- name: Bootstrap New Cluster (Fresh Install Only)
   hosts: mariadb[0]
   become: true
   gather_facts: false
   tags: [deploy, deploy-mariadb]
   tasks:
-    - name: Check if cluster is already running
-      ansible.builtin.shell: |
-        systemctl is-active mariadb && mariadb -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | grep -oP '\d+' || echo "0"
-      register: cluster_size_check
-      changed_when: false
-      failed_when: false
+    - name: Check if bootstrap needed
+      ansible.builtin.set_fact:
+        needs_bootstrap: "{{ not hostvars['localhost']['cluster_exists'] }}"
 
-    - name: Bootstrap cluster if not running
-      when: cluster_size_check.stdout | int < 1
+    - name: Fresh install bootstrap
+      when: needs_bootstrap
       block:
+        - name: Stop MariaDB before bootstrap
+          ansible.builtin.systemd:
+            name: mariadb
+            state: stopped
+          ignore_errors: true
+
         - name: Set safe_to_bootstrap flag
           ansible.builtin.lineinfile:
             path: "{{ mysql_data_dir }}/grastate.dat"
@@ -243,33 +276,90 @@
             delay: 5
             timeout: 60
 
-# =============================================================================
-# DEPLOY: Start Remaining Nodes (SEQUENTIAL - Required for SST)
-# =============================================================================
-- name: Start Remaining MariaDB Nodes
+- name: Start Remaining Nodes (Fresh Install Only)
   hosts: mariadb[1:]
   become: true
   gather_facts: false
   serial: 1
   tags: [deploy, deploy-mariadb]
   tasks:
-    - name: Start MariaDB
+    - name: Check if fresh install
+      ansible.builtin.set_fact:
+        is_fresh_install: "{{ not hostvars['localhost']['cluster_exists'] }}"
+
+    - name: Fresh install - stop and start node
+      when: is_fresh_install
+      block:
+        - name: Stop MariaDB
+          ansible.builtin.systemd:
+            name: mariadb
+            state: stopped
+          ignore_errors: true
+
+        - name: Start MariaDB
+          ansible.builtin.systemd:
+            name: mariadb
+            state: started
+            enabled: true
+
+        - name: Wait for node to sync
+          ansible.builtin.shell: |
+            mariadb -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | grep -i synced
+          register: sync_status
+          until: sync_status.rc == 0
+          retries: 30
+          delay: 10
+          changed_when: false
+
+# =============================================================================
+# DEPLOY: Existing Cluster - Rolling Restart (Only if config changed)
+# =============================================================================
+- name: Rolling Restart Existing Cluster (Config Changed Only)
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  serial: 1
+  tags: [deploy, deploy-mariadb]
+  tasks:
+    - name: Check if rolling restart needed
+      ansible.builtin.set_fact:
+        needs_rolling_restart: "{{ hostvars['localhost']['cluster_exists'] and config_changed }}"
+
+    - name: Rolling restart node
+      when: needs_rolling_restart
+      block:
+        - name: Restart MariaDB
+          ansible.builtin.systemd:
+            name: mariadb
+            state: restarted
+
+        - name: Wait for node to sync
+          ansible.builtin.shell: |
+            mariadb -u {{ admin_user }} -p'{{ admin_password }}' -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | grep -i synced
+          register: sync_status
+          until: sync_status.rc == 0
+          retries: 30
+          delay: 10
+          changed_when: false
+          no_log: true
+
+# =============================================================================
+# DEPLOY: Ensure All Nodes Running (Idempotent)
+# =============================================================================
+- name: Ensure All Nodes Running
+  hosts: mariadb
+  become: true
+  gather_facts: false
+  tags: [deploy, deploy-mariadb]
+  tasks:
+    - name: Ensure MariaDB is started and enabled
       ansible.builtin.systemd:
         name: mariadb
         state: started
         enabled: true
 
-    - name: Wait for node to sync
-      ansible.builtin.shell: |
-        mariadb -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | grep -i synced
-      register: sync_status
-      until: sync_status.rc == 0
-      retries: 30
-      delay: 10
-      changed_when: false
-
 # =============================================================================
-# DEPLOY: Secure Cluster
+# DEPLOY: Secure Cluster (Idempotent)
 # =============================================================================
 - name: Secure Cluster
   hosts: mariadb[0]
@@ -321,6 +411,7 @@
         login_unix_socket: /run/mysqld/mysqld.sock
         state: absent
       no_log: true
+      ignore_errors: true
 
     - name: Remove test database
       community.mysql.mysql_db:
@@ -330,9 +421,10 @@
         login_unix_socket: /run/mysqld/mysqld.sock
         state: absent
       no_log: true
+      ignore_errors: true
 
 # =============================================================================
-# DEPLOY: Galera Arbitrator (PARALLEL)
+# DEPLOY: Galera Arbitrator (Idempotent)
 # =============================================================================
 - name: Deploy Galera Arbitrator
   hosts: garbd
@@ -340,10 +432,17 @@
   gather_facts: true
   tags: [deploy, deploy-garbd]
   tasks:
+    - name: Check if garbd is installed
+      ansible.builtin.shell: dpkg -l | grep -q galera-arbitrator && echo "installed" || echo "not_installed"
+      register: garbd_installed
+      changed_when: false
+      failed_when: false
+
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
+      when: garbd_installed.stdout != "installed"
 
     - name: Install Galera Arbitrator
       ansible.builtin.apt:
@@ -355,15 +454,23 @@
         src: templates/garb.j2
         dest: /etc/default/garb
         mode: "0644"
+      register: garbd_config
 
-    - name: Restart and enable garbd
+    - name: Restart garbd (config changed)
       ansible.builtin.systemd:
         name: garb
         state: restarted
         enabled: true
+      when: garbd_config.changed
+
+    - name: Ensure garbd is running
+      ansible.builtin.systemd:
+        name: garb
+        state: started
+        enabled: true
 
 # =============================================================================
-# DEPLOY: HAProxy Load Balancers (PARALLEL)
+# DEPLOY: HAProxy Load Balancers (Idempotent)
 # =============================================================================
 - name: Deploy HAProxy Load Balancers
   hosts: loadbalancers
@@ -371,10 +478,17 @@
   gather_facts: true
   tags: [deploy, deploy-haproxy]
   tasks:
+    - name: Check if HAProxy is installed
+      ansible.builtin.shell: dpkg -l | grep -q haproxy && echo "installed" || echo "not_installed"
+      register: haproxy_installed
+      changed_when: false
+      failed_when: false
+
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
+      when: haproxy_installed.stdout != "installed"
 
     - name: Install HAProxy
       ansible.builtin.apt:
@@ -390,23 +504,32 @@
         mode: "0644"
         backup: true
         validate: "haproxy -c -f %s"
+      register: haproxy_config
 
-    - name: Restart and enable HAProxy
+    - name: Restart HAProxy (config changed)
       ansible.builtin.systemd:
         name: haproxy
         state: restarted
         enabled: true
         daemon_reload: true
+      when: haproxy_config.changed
 
-    - name: Wait for HAProxy to start
+    - name: Ensure HAProxy is running
+      ansible.builtin.systemd:
+        name: haproxy
+        state: started
+        enabled: true
+
+    - name: Wait for HAProxy to be ready
       ansible.builtin.pause:
-        seconds: 3
+        seconds: 2
+      when: haproxy_config.changed
 
-    - name: Verify HAProxy is listening on MySQL port
+    - name: Verify HAProxy is listening
       ansible.builtin.shell: ss -tlnp | grep ":{{ mysql_port }}"
-      register: haproxy_mysql_check
+      register: haproxy_check
       changed_when: false
-      failed_when: haproxy_mysql_check.rc != 0
+      failed_when: haproxy_check.rc != 0
 
 # =============================================================================
 # DEPLOY: Verification
@@ -442,16 +565,6 @@
 # =============================================================================
 # STATUS: Check Cluster Status (PARALLEL)
 # =============================================================================
-- name: Prepare for Status Check
-  hosts: mariadb:loadbalancers:garbd
-  become: true
-  gather_facts: false
-  tags: [status, status-detailed]
-  tasks:
-    - name: Ensure Ansible temp directory exists
-      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
-      changed_when: false
-
 - name: Check MariaDB Status
   hosts: mariadb
   become: true
@@ -574,7 +687,7 @@
           {% endif %}
           ============================================
 
-- name: Detailed Status (per node)
+- name: Detailed Status
   hosts: mariadb
   become: true
   gather_facts: false
@@ -596,7 +709,7 @@
       when: full_wsrep.rc == 0
 
 # =============================================================================
-# RECOVER: Cluster Recovery
+# RECOVER: Cluster Recovery (Manual trigger only)
 # =============================================================================
 - name: Confirm Recovery
   hosts: localhost
@@ -620,19 +733,6 @@
       ansible.builtin.pause:
         prompt: "Press ENTER to continue or Ctrl+C to abort"
 
-- name: Prepare for Recovery
-  hosts: mariadb:garbd
-  become: true
-  gather_facts: false
-  tags: [recover]
-  tasks:
-    - name: Ensure Ansible temp directory exists
-      ansible.builtin.raw: mkdir -p ~/.ansible/tmp && chmod 0700 ~/.ansible/tmp
-      changed_when: false
-
-# =============================================================================
-# RECOVER: Stop All Services (PARALLEL)
-# =============================================================================
 - name: Stop All Services
   hosts: mariadb
   become: true
@@ -657,9 +757,6 @@
         state: stopped
       ignore_errors: true
 
-# =============================================================================
-# RECOVER: Find Most Recent Node (PARALLEL)
-# =============================================================================
 - name: Find Most Recent Node
   hosts: mariadb
   become: true
@@ -725,9 +822,6 @@
         line: "safe_to_bootstrap: 1"
       when: is_bootstrap
 
-# =============================================================================
-# RECOVER: Bootstrap and Rejoin (SEQUENTIAL - Required)
-# =============================================================================
 - name: Bootstrap and Rejoin Cluster
   hosts: mariadb
   become: true

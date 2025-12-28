@@ -9,6 +9,7 @@ Production-ready Ansible automation for deploying highly available MariaDB Galer
 - **Load balancing**: Optional HAProxy with stats dashboard
 - **Arbitrator support**: Optional Garbd for even-numbered setups
 - **Single playbook**: All operations in one `mariadb.yml` with tags
+- **Idempotent**: Safe to run multiple times - detects existing cluster state
 - **Parallel execution**: Fast deployment with parallel install/configure
 - **Automated recovery**: One-command cluster recovery
 
