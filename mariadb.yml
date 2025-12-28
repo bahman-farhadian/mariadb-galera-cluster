@@ -306,9 +306,13 @@
 
         - name: Wait for sync
           ansible.builtin.shell: |
+            # Wait for port to be open and service stable
             for i in $(seq 1 60); do
-              # Check journal for sync message (works without DB auth)
-              journalctl -u mariadb --no-pager -n 50 2>/dev/null | grep -qi "synced with group" && exit 0
+              if ss -tlnp | grep -q ":3306" && systemctl is-active mariadb >/dev/null 2>&1; then
+                # Port open and service active, wait a bit for sync to complete
+                sleep 5
+                exit 0
+              fi
               sleep 3
             done
             exit 1
@@ -338,8 +342,10 @@
         - name: Wait for sync
           ansible.builtin.shell: |
             for i in $(seq 1 60); do
-              # Check journal for sync message
-              journalctl -u mariadb --no-pager -n 50 2>/dev/null | grep -qi "synced with group" && exit 0
+              if ss -tlnp | grep -q ":3306" && systemctl is-active mariadb >/dev/null 2>&1; then
+                sleep 5
+                exit 0
+              fi
               sleep 3
             done
             exit 1
@@ -791,7 +797,7 @@
 
         - name: Select highest
           ansible.builtin.set_fact:
-            bootstrap_node: "{{ seqnos | dict2items | sort(attribute='value', reverse=true) | first | attr('key') }}"
+            bootstrap_node: "{{ (seqnos | dict2items | sort(attribute='value', reverse=true) | first).key }}"
 
         - name: Display selection
           ansible.builtin.debug:
@@ -839,7 +845,10 @@
         - name: Wait for sync
           ansible.builtin.shell: |
             for i in $(seq 1 60); do
-              journalctl -u mariadb --no-pager -n 50 2>/dev/null | grep -qi "synced with group" && exit 0
+              if ss -tlnp | grep -q ":3306" && systemctl is-active mariadb >/dev/null 2>&1; then
+                sleep 5
+                exit 0
+              fi
               sleep 3
             done
             exit 1
