@@ -106,7 +106,7 @@
 
     - name: Check wsrep cluster status
       ansible.builtin.shell: |
-        mariadb -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null || echo "0"
+        mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null || echo "0"
       register: wsrep_size
       changed_when: false
       failed_when: false
@@ -303,8 +303,8 @@
         - name: Wait for sync
           ansible.builtin.shell: |
             for i in $(seq 1 30); do
-              mariadb -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment';" 2>/dev/null | grep -qi synced && exit 0
-              sleep 10
+              mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment';" 2>/dev/null | grep -qi synced && exit 0
+              sleep 5
             done
             exit 1
           changed_when: false
@@ -333,8 +333,8 @@
         - name: Wait for sync
           ansible.builtin.shell: |
             for i in $(seq 1 30); do
-              mariadb -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment';" 2>/dev/null | grep -qi synced && exit 0
-              sleep 10
+              mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment';" 2>/dev/null | grep -qi synced && exit 0
+              sleep 5
             done
             exit 1
           changed_when: false
@@ -833,8 +833,8 @@
         - name: Wait for sync
           ansible.builtin.shell: |
             for i in $(seq 1 60); do
-              mariadb -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment';" 2>/dev/null | grep -qi synced && exit 0
-              sleep 10
+              mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_local_state_comment';" 2>/dev/null | grep -qi synced && exit 0
+              sleep 5
             done
             exit 1
           changed_when: false
@@ -860,7 +860,7 @@
   tasks:
     - name: Get cluster size
       ansible.builtin.shell: |
-        mariadb -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null || echo "0"
+        mariadb --socket=/run/mysqld/mysqld.sock -N -e "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='wsrep_cluster_size';" 2>/dev/null || echo "0"
       register: size
       changed_when: false
       when: confirm | default(false) | bool
