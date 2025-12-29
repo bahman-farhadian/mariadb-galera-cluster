@@ -19,10 +19,16 @@ haproxy_nodes:
   - { ip: "192.168.1.21", name: "mariadb-lb-2" }
 
 # -----------------------------------------------------------------------------
-# GALERA ARBITRATOR (optional - for even node counts)
+# GALERA ARBITRATOR (for even node counts)
+# IMPORTANT: Must set BOTH garbd_enabled: true AND provide garbd_nodes
+# Garbd VMs must be SEPARATE from mariadb_nodes!
 # -----------------------------------------------------------------------------
 garbd_enabled: false
 garbd_nodes: []
+# Example for 2 or 4 MariaDB nodes:
+#   garbd_enabled: true
+#   garbd_nodes:
+#     - { ip: "192.168.1.30", name: "garbd-1" }
 garbd_port: 4568
 
 # -----------------------------------------------------------------------------

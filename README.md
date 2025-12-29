@@ -240,6 +240,39 @@ mariadb-galera-cluster/
     └── garb.j2           # Garbd configuration
 ```
 
+## Troubleshooting
+
+### Warning: "Collection ansible.posix does not support Ansible version X"
+
+This warning appears with Ansible < 2.15. Options to fix:
+
+**Option 1**: Upgrade Ansible (recommended)
+```bash
+pip install --upgrade ansible
+```
+
+**Option 2**: Suppress the warning
+```bash
+export ANSIBLE_LOCALHOST_WARNING=False
+ansible-playbook mariadb.yml --tags deploy 2>&1 | grep -v "ansible.posix"
+```
+
+### Garbd not deploying
+
+Make sure you set **BOTH** values:
+```yaml
+garbd_enabled: true    # Must be true!
+garbd_nodes:
+  - { ip: "192.168.1.30", name: "garbd-1" }
+```
+
+### Cluster won't start after power failure
+
+Use recovery mode:
+```bash
+ansible-playbook mariadb.yml --tags recover -e confirm=yes
+```
+
 ## License
 
 MIT
