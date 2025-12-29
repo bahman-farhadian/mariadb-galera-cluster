@@ -1,28 +1,10 @@
 ---
 # =============================================================================
-# MariaDB Galera Cluster - Configuration Variables
+# MariaDB Galera Cluster - Configuration
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# CLUSTER NODES CONFIGURATION
-# -----------------------------------------------------------------------------
-# Define the IP addresses of your MariaDB Galera nodes.
-# IMPORTANT: Keep the number of nodes ODD (3, 5, 7, etc.) to ensure proper
-# quorum and avoid split-brain scenarios. Minimum recommended is 3 nodes.
-#
-# Example for 3 nodes:
-#   mariadb_nodes:
-#     - { ip: "192.168.1.10", name: "mariadb-node-1" }
-#     - { ip: "192.168.1.11", name: "mariadb-node-2" }
-#     - { ip: "192.168.1.12", name: "mariadb-node-3" }
-#
-# Example for 5 nodes:
-#   mariadb_nodes:
-#     - { ip: "192.168.1.10", name: "mariadb-node-1" }
-#     - { ip: "192.168.1.11", name: "mariadb-node-2" }
-#     - { ip: "192.168.1.12", name: "mariadb-node-3" }
-#     - { ip: "192.168.1.13", name: "mariadb-node-4" }
-#     - { ip: "192.168.1.14", name: "mariadb-node-5" }
+# CLUSTER NODES (use ODD number: 3, 5, 7)
 # -----------------------------------------------------------------------------
 mariadb_nodes:
   - { ip: "192.168.1.10", name: "mariadb-node-1" }
@@ -30,111 +12,53 @@ mariadb_nodes:
   - { ip: "192.168.1.12", name: "mariadb-node-3" }
 
 # -----------------------------------------------------------------------------
-# HAPROXY LOAD BALANCER NODES (Optional)
-# -----------------------------------------------------------------------------
-# Define HAProxy load balancer nodes for high-availability endpoints.
-# Leave empty [] if you don't need load balancers.
-#
-# Example:
-#   haproxy_nodes:
-#     - { ip: "192.168.1.20", name: "mariadb-lb-1" }
-#     - { ip: "192.168.1.21", name: "mariadb-lb-2" }
+# HAPROXY LOAD BALANCERS (optional - set to [] to disable)
 # -----------------------------------------------------------------------------
 haproxy_nodes:
   - { ip: "192.168.1.20", name: "mariadb-lb-1" }
   - { ip: "192.168.1.21", name: "mariadb-lb-2" }
 
 # -----------------------------------------------------------------------------
-# GALERA ARBITRATOR (GARBD) CONFIGURATION - Optional
-# -----------------------------------------------------------------------------
-# Enable this if you have an EVEN number of data nodes and need to maintain
-# an odd number of voters for proper quorum.
-#
-# When to use garbd:
-#   - 2 data nodes: enable garbd on 1 separate node (Total: 3 voters)
-#   - 4 data nodes: enable garbd on 1 separate node (Total: 5 voters)
-#   - 6 data nodes: enable garbd on 1 separate node (Total: 7 voters)
-#
-# When NOT needed:
-#   - 3, 5, 7 (odd) data nodes already have odd voter count
-#
-# garbd_nodes should be separate VMs from the mariadb_nodes for proper
-# failure domain isolation.
+# GALERA ARBITRATOR (optional - for even node counts)
 # -----------------------------------------------------------------------------
 garbd_enabled: false
-
-# Example garbd nodes (only used when garbd_enabled: true):
-#   garbd_nodes:
-#     - { ip: "192.168.1.30", name: "garbd-node-1" }
 garbd_nodes: []
-
-# Garbd listen port (different from MariaDB Galera port)
 garbd_port: 4568
 
 # -----------------------------------------------------------------------------
 # CLUSTER SETTINGS
 # -----------------------------------------------------------------------------
-# Cluster name - must be identical across all nodes
 cluster_name: "production_cluster"
-
-# State Snapshot Transfer method
-# Options: rsync, mariabackup
-# mariabackup is recommended for production (donor remains operational)
-sst_method: "rsync"
+sst_method: "rsync"  # rsync or mariabackup
 
 # -----------------------------------------------------------------------------
-# DATABASE CREDENTIALS
+# DATABASE CREDENTIALS (CHANGE THESE!)
 # -----------------------------------------------------------------------------
-# MariaDB root password
-# IMPORTANT: Change this to a strong password before deployment!
 mariadb_root_password: "ChangeMe_RootPassword123!"
-
-# Administrative user for remote management
-# This user has full privileges and can connect from any host
 admin_user: "admin"
 admin_password: "ChangeMe_AdminPassword123!"
-
-# SST user (only needed if sst_method is mariabackup)
-# This user is used for state snapshot transfers between nodes
 sst_user: "sst_user"
 sst_password: "ChangeMe_SSTPassword123!"
 
 # -----------------------------------------------------------------------------
 # NETWORK PORTS
 # -----------------------------------------------------------------------------
-# MariaDB client connections
 mysql_port: 3306
-
-# Galera cluster replication
 galera_port: 4567
-
-# Incremental State Transfer (IST)
 ist_port: 4568
-
-# State Snapshot Transfer (SST)
 sst_port: 4444
 
 # -----------------------------------------------------------------------------
-# PATHS AND DIRECTORIES
+# PATHS
 # -----------------------------------------------------------------------------
 mysql_log_dir: "/var/log/mysql"
 mysql_data_dir: "/var/lib/mysql"
 mysql_conf_dir: "/etc/mysql/mariadb.conf.d"
 
 # -----------------------------------------------------------------------------
-# HAPROXY SETTINGS
+# HAPROXY STATS (CHANGE PASSWORD!)
 # -----------------------------------------------------------------------------
-# HAProxy stats page (optional)
 haproxy_stats_enabled: true
 haproxy_stats_port: 8404
 haproxy_stats_user: "admin"
 haproxy_stats_password: "ChangeMe_StatsPassword123!"
-
-# -----------------------------------------------------------------------------
-# TIMEOUTS AND TUNING
-# -----------------------------------------------------------------------------
-# Wait time for cluster sync (seconds)
-cluster_sync_timeout: 300
-
-# MariaDB connection timeout
-mysql_connect_timeout: 10
